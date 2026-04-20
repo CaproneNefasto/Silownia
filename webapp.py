@@ -1,25 +1,105 @@
 from flask import Flask, jsonify, render_template_string, request
-import requests
+import serial
+import threading
+import re
+import statistics
 
+
+SMOOTH_WINDOW = 7        # wygładzanie (tylko nieparzyste: 1, 3, 5, 7)
+COOLDOWN_SAMPLES = 10    # minimalna odległość między szczytami — ZMNIEJSZ jeśli wykrywa za mało
+THRESHOLD_SENSITIVITY = 0.25  # czułość progu: mniejsza = więcej szczytów (0.1–1.0)
 app = Flask(__name__)
-IOT_URL = "http://localhost:5000"
+
+# Konfiguracja Bluetooth (Zmień na swój port z Windowsa, np. COM5)
+BLUETOOTH_PORT = "COM6" 
+bt_serial = None
+is_recording = False
+current_workout_data = []
+
+
 
 workout_log = []
 current_exercise = "Bench Press"
-THRESHOLD = 80 
+THRESHOLD = 1.5 # UWAGA: Zmieniłem z 80 na 1.5. Akcelerometr domyślnie pokazuje ok 1.0g na osi Z w spoczynku.
+def moving_average(values, window):
+    """Wygładzanie sygnału — zmniejsza szum."""
+    result = []
+    half = window // 2
+    for i in range(len(values)):
+        start = max(0, i - half)
+        end = min(len(values) - 1, i + half)
+        chunk = values[start:end + 1]
+        result.append(sum(chunk) / len(chunk))
+    return result
 
 def calculate_reps(data):
-    if len(data) < 5: return 0, 0 
+    if len(data) < 5:
+        return 0, 0.0
+
+    axes_signals = {
+        "x": [d["accelerometer"][0] for d in data],
+        "y": [d["accelerometer"][1] for d in data],
+        "z": [d["accelerometer"][2] for d in data],
+    }
+    variances = {ax: statistics.variance(vals) for ax, vals in axes_signals.items()}
+    dominant_axis = max(variances, key=variances.get)
+    raw_signal = axes_signals[dominant_axis]
+    smoothed = moving_average(raw_signal, SMOOTH_WINDOW)
+
+    mean_val = statistics.mean(smoothed)
+    stdev_val = statistics.stdev(smoothed)
+    threshold = mean_val + THRESHOLD_SENSITIVITY * stdev_val
+
     reps = 0
-    max_z = 0
-    for i in range(1, len(data) - 1):
-        z_prev = data[i-1]["accelerometer"][2]
-        z_curr = data[i]["accelerometer"][2]
-        z_next = data[i+1]["accelerometer"][2]
-        if z_curr > max_z: max_z = z_curr
-        if z_curr > THRESHOLD and z_curr >= z_prev and z_curr >= z_next:
+    max_val = max(smoothed)
+    cooldown_counter = 0
+
+    for i in range(1, len(smoothed) - 1):
+        if cooldown_counter > 0:
+            cooldown_counter -= 1
+            continue
+        if (smoothed[i] > threshold
+                and smoothed[i] > smoothed[i-1]
+                and smoothed[i] > smoothed[i+1]):
             reps += 1
-    return reps, round(max_z, 2)
+            cooldown_counter = COOLDOWN_SAMPLES
+
+    return reps, round(max_val, 2)
+
+
+
+# --- FUNKCJA ZBIERAJĄCA DANE W TLE ---
+def collect_bluetooth_data():
+    global is_recording, current_workout_data, bt_serial
+    while is_recording:
+        try:
+            # POMIJAMY sprawdzanie "in_waiting" (Windows często przy BT kłamie)
+            # Czytamy bezpośrednio - najwyżej poczeka do końca timeoutu
+            line = bt_serial.readline().decode('utf-8', errors='ignore').strip()
+            
+            if not line:
+                continue # Pusta linia, czekamy dalej
+                
+            # === DRUKUJEMY SUROWE DANE (To pokaże nam prawdę!) ===
+            print(f"📡 Otrzymano: {line}")
+            
+            # Próbujemy wyciągnąć dane w starym formacie z nawiasami [...]
+            match = re.search(r'Akcelerometr:\s*\[([^\]]+)\]', line)
+            if match:
+                coords = match.group(1).split(',')
+                z_val = float(coords[2].strip())
+                current_workout_data.append({
+                    "accelerometer": [float(coords[0]), float(coords[1]), z_val]
+                })
+            # Jeśli malinka wysyła coś innego (np. słownik albo nawiasy okrągłe)
+            else:
+                pass # Na razie ignorujemy błąd dopasowania, ważne żebyśmy zobaczyli "Otrzymano:"
+                
+        except Exception as e:
+            if is_recording:
+                print(f"Błąd odczytu linii: {e}")
+
+# --- ENDPOINTY FLASK ---
 
 @app.route('/')
 def index():
@@ -27,27 +107,58 @@ def index():
 
 @app.route('/app/start', methods=['POST'])
 def app_start():
+    global is_recording, current_workout_data, bt_serial
+    
+    current_workout_data = [] # Czyścimy dane z poprzedniego treningu
+    is_recording = True
+    
     try:
-        requests.post(f"{IOT_URL}/iot/start", timeout=1)
+        print(f"⏳ Otwieranie portu {BLUETOOTH_PORT}... (to może potrwać kilka sekund)")
+        
+        # Nowa, kuloodporna konfiguracja dla Bluetooth w Windowsie
+        bt_serial = serial.Serial(
+            port=BLUETOOTH_PORT, 
+            baudrate=9600, 
+            timeout=5,          # Dajemy Windowsowi aż 5 sekund na negocjację BT!
+            write_timeout=5,
+            dsrdtr=False,       # Ignorujemy sprawdzanie fizycznego kabla
+            rtscts=False        # Ignorujemy sprzętowe sterowanie przepływem
+        )
+        
+        # Jeśli doszliśmy tutaj, port się otworzył!
+        thread = threading.Thread(target=collect_bluetooth_data)
+        thread.start()
+        print("▶ ROZPOCZĘTO TRENING I NASŁUCH BLUETOOTH!")
         return jsonify({"status": "started"})
-    except: return jsonify({"error": "Błąd IoT"}), 503
+        
+    except Exception as e:
+        is_recording = False
+        # TEN PRINT JEST KLUCZOWY - pokaże nam dokładnie, co Windows blokuje
+        print(f"\n❌❌❌ KRYTYCZNY BŁĄD PYSERIAL: {e} ❌❌❌\n")
+        return jsonify({"error": f"Błąd portu COM: {str(e)}"}), 503
 
 @app.route('/app/stop', methods=['POST'])
 def app_stop():
-    try:
-        response = requests.post(f"{IOT_URL}/iot/stop", timeout=2)
-        iot_payload = response.json()
-        raw_data = iot_payload.get("workout_data", [])
-        total_reps, peak = calculate_reps(raw_data)
-        workout_log.append({"exercise": current_exercise, "reps": total_reps, "peak": peak})
-        return jsonify({
-            "total_reps": total_reps, 
-            "max_peak": peak, 
-            "raw_data": raw_data, 
-            "threshold": THRESHOLD,
-            "exercise": current_exercise
-        })
-    except: return jsonify({"error": "Błąd danych"}), 503
+    global is_recording, bt_serial
+    
+    # Zatrzymujemy nasłuch i zamykamy port Bluetooth
+    is_recording = False
+    if bt_serial and bt_serial.is_open:
+        bt_serial.close()
+        
+    print(f"⏹ Zakończono trening. Zebrano {len(current_workout_data)} punktów danych.")
+
+    # Analizujemy zebrane dane
+    total_reps, peak = calculate_reps(current_workout_data)
+    workout_log.append({"exercise": current_exercise, "reps": total_reps, "peak": peak})
+    
+    return jsonify({
+        "total_reps": total_reps, 
+        "max_peak": peak, 
+        "raw_data": current_workout_data, 
+        "threshold": THRESHOLD,
+        "exercise": current_exercise
+    })
 
 @app.route('/app/log', methods=['GET'])
 def get_log():
@@ -60,7 +171,9 @@ def set_exercise():
     current_exercise = data.get("exercise", "Bench Press")
     return jsonify({"status": "ok", "exercise": current_exercise})
 
-# --- SZABLON HTML (DODANO PANEL REJESTRACJI) ---
+# ==========================================
+# TUTAJ WKLEJ SWOJĄ ZMIENNĄ HTML_TEMPLATE (cały kod strony HTML)
+# HTML_TEMPLATE = """ ... """
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="pl">
@@ -288,6 +401,7 @@ HTML_TEMPLATE = """
 </body>
 </html>
 """
+# ==========================================
 
 if __name__ == "__main__":
     app.run(port=8080, debug=False)
